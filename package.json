@@ -1,0 +1,21 @@
+{
+  "name": "@fazpi-ai/b-task",
+  "version": "1.0.0",
+  "description": "Simple library for processing messages between microservices.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fazpi-ai/b-task.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/fazpi-ai/b-task/issues"
+  },
+  "homepage": "https://github.com/fazpi-ai/b-task#readme"
+}
