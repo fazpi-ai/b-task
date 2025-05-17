@@ -17,5 +17,9 @@
   "bugs": {
     "url": "https://github.com/fazpi-ai/b-task/issues"
   },
-  "homepage": "https://github.com/fazpi-ai/b-task#readme"
+  "homepage": "https://github.com/fazpi-ai/b-task#readme",
+  "dependencies": {
+    "ioredis": "^5.6.1",
+    "uuid": "^11.1.0"
+  }
 }
