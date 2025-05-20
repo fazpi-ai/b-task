@@ -152,22 +152,42 @@ class Worker extends EventEmitter {
     }
 
     async completeJob(jobId, result, workerId, originalJob) {
+        // Log al iniciar el proceso de completar el trabajo
+        console.log(`[${workerId}] Iniciando proceso para marcar job ${jobId} como COMPLETADO. Resultado:`, result);
+
         const timestamp = Date.now();
 
-        await this.queue.redis.hmset(`${this.queue.keys.jobs}:${jobId}`, {
-            result: JSON.stringify(result),
-            completedAt: timestamp,
-            status: 'completed'
-        });
+        console.log("TIMESTAMP:")
+        console.log(timestamp)
 
-        await this.queue.redis.zrem(this.queue.keys.active, jobId);
-        await this.queue.redis.zadd(this.queue.keys.completed, timestamp, jobId);
-        await this.queue.redis.hincrby(this.queue.keys.queue, 'active', -1);
-        await this.queue.redis.hincrby(this.queue.keys.queue, 'completed', 1);
+        try {
+            // Actualizar los datos del job en Redis
+            await this.queue.redis.hmset(`${this.queue.keys.jobs}:${jobId}`, {
+                result: JSON.stringify(result),
+                completedAt: timestamp,
+                status: 'completed'
+            });
 
-        console.log(`[${workerId}] Job ${jobId} completed successfully`);
-        // 3. Emitir evento 'job.completed'
-        this.emit('job.completed', { jobId, result, job: originalJob, workerId });
+            // Mover de la lista active a la lista completed
+            await this.queue.redis.zrem(this.queue.keys.active, jobId);
+            await this.queue.redis.zadd(this.queue.keys.completed, timestamp, jobId);
+
+            // Actualizar contadores globales de la cola
+            await this.queue.redis.hincrby(this.queue.keys.queue, 'active', -1);
+            await this.queue.redis.hincrby(this.queue.keys.queue, 'completed', 1);
+
+            // Log después de que todas las operaciones en Redis han sido exitosas
+            console.log(`[${workerId}] Job ${jobId} marcado exitosamente como COMPLETADO en Redis y contadores actualizados.`);
+
+            // Emitir evento 'job.completed' (esto ya lo tenías y es bueno mantenerlo)
+            this.emit('job.completed', { jobId, result, job: originalJob, workerId });
+        } catch (error) {
+            // Log en caso de error durante el proceso de completar
+            console.error(`[${workerId}] ERROR al intentar marcar job ${jobId} como completado en Redis:`, error);
+            // Considera si necesitas emitir un evento de error específico aquí o re-lanzar el error
+            // Por ahora, el error se propagará si esta función es llamada con await y no tiene su propio try/catch más arriba.
+            throw error; // Es importante re-lanzar para que el flujo que llamó sepa del error
+        }
     }
 
     async failJob(jobId, error, workerId, originalJobFromQueue, attemptThatFailed) {

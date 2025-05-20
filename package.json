@@ -1,6 +1,6 @@
 {
   "name": "@fazpi-ai/b-task",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "description": "Simple library for processing messages between microservices.",
   "type": "module",
   "main": "index.js",
