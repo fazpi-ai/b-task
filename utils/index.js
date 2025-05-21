@@ -1,7 +1,8 @@
 import fs from 'fs/promises';
 import path from 'path';
-// Quitamos las importaciones y usos de fileURLToPath e import.meta.url
-// Confiaremos en el __dirname que Babel debería proveer al transpilar a CommonJS para Jest.
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export async function loadScripts() {
     // Cuando este archivo ESM es transpilado a CommonJS por Babel para Jest,
@@ -15,16 +16,23 @@ export async function loadScripts() {
     // Por lo tanto, path.join(__dirname, '../luas') es correcto.
     
     const scriptsDir = path.join(__dirname, '../luas');
+    console.log('Intentando cargar scripts desde:', scriptsDir);
 
     try {
         const scriptFiles = await fs.readdir(scriptsDir);
+        console.log('Archivos encontrados:', scriptFiles);
+        
         const scripts = {};
         for (const file of scriptFiles) {
             if (path.extname(file) === '.lua') {
                 const scriptName = path.basename(file, '.lua');
+                console.log('Cargando script:', scriptName);
                 scripts[scriptName] = await fs.readFile(path.join(scriptsDir, file), 'utf8');
             }
         }
+        
+        console.log('Scripts cargados:', Object.keys(scripts));
+        
         if (Object.keys(scripts).length === 0) {
             console.warn(`[WARN] utils/index.js: No Lua scripts found in ${scriptsDir}. This might lead to errors in Queue initialization if scripts are expected.`);
         }

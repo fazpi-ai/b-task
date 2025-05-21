@@ -32,7 +32,9 @@ class Queue {
     }
 
     async init() {
+        console.log('Iniciando carga de scripts...');
         const loadedLuaScripts = await loadScripts();
+        console.log('Scripts cargados desde archivos:', Object.keys(loadedLuaScripts));
 
         const scriptDefinitions = {
             addJob: { numberOfKeys: 4, lua: loadedLuaScripts.addJob },
@@ -46,19 +48,45 @@ class Queue {
 
         for (const [name, def] of Object.entries(scriptDefinitions)) {
             if (!def.lua) {
-                console.warn(`[Queue ${this.name}] Lua script for '${name}' (expected file: ${name.replace('Lua', '').toLowerCase()}.lua or similar) not found or loaded. Functionality depending on it will fail.`);
+                console.warn(`[Queue ${this.name}] Lua script for '${name}' not found or loaded.`);
                 continue;
             }
-            // Usar el nombre de la propiedad (ej. 'handleFailureLua') para definir el comando
-            this.scripts[name] = this.redis.defineCommand(name, def);
+            console.log(`Definiendo comando '${name}' en Redis...`);
+            try {
+                // Definir el comando en Redis
+                const sha = await this.redis.script('load', def.lua);
+                console.log(`Script '${name}' cargado con SHA: ${sha}`);
+                
+                // Crear una función que ejecute el script
+                this.scripts[name] = async (...args) => {
+                    try {
+                        return await this.redis.evalsha(sha, def.numberOfKeys, ...args);
+                    } catch (err) {
+                        if (err.message.includes('NOSCRIPT')) {
+                            // Si el script no está en Redis, volver a cargarlo
+                            const newSha = await this.redis.script('load', def.lua);
+                            return await this.redis.evalsha(newSha, def.numberOfKeys, ...args);
+                        }
+                        throw err;
+                    }
+                };
+                console.log(`Comando '${name}' definido exitosamente.`);
+            } catch (error) {
+                console.error(`Error al definir comando '${name}':`, error);
+                throw error;
+            }
         }
 
+        console.log('Verificando contadores en Redis...');
         const countersExist = await this.redis.exists(this.keys.queue);
         if (!countersExist) {
             await this.redis.hmset(this.keys.queue, {
                 waiting: 0, active: 0, completed: 0, failed: 0,
                 totalProcessed: 0, totalFailedPermanently: 0, totalRetried: 0,
             });
+            console.log('Contadores inicializados.');
+        } else {
+            console.log('Contadores ya existen.');
         }
     }
 

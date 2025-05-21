@@ -22,7 +22,7 @@ local function clearJobQueueAndHashes(queueZsetKey)
         local jobHashKeysToDelete = {}
         for i, jobId in ipairs(jobIds) do
             table.insert(jobHashKeysToDelete, jobsPrefix .. ':' .. jobId)
-        }
+        end
         redis.call('DEL', unpack(jobHashKeysToDelete))
         totalJobsDeletedCount = totalJobsDeletedCount + #jobIds
     end
