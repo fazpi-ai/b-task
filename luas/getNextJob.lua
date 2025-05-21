@@ -1,42 +1,53 @@
--- Script para obtener el siguiente trabajo de la cola
-local queueKey = KEYS[1]
-local jobsKey = KEYS[2]
-local waitKey = KEYS[3]
-local activeKey = KEYS[4]
-local timestamp = ARGV[1]
+-- getNextJob.lua
+--
+-- KEYS[1]: partitionSpecificWaitingQueueKey
+-- KEYS[2]: globalActiveQueueKey
+-- KEYS[3]: jobsHashKeyPrefix
+-- KEYS[4]: globalQueueCountersKey
+--
+-- ARGV[1]: currentTime (timestamp actual)
+-- ARGV[2]: leaseDurationMilliseconds (cuánto dura el "alquiler" del job)
 
--- Obtener el trabajo más antiguo de la lista de espera
-local jobs = redis.call('ZRANGE', waitKey, 0, 0, 'WITHSCORES')
+local jobs = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
 if #jobs == 0 then
     return nil
 end
 
 local jobId = jobs[1]
-local jobKey = jobsKey .. ':' .. jobId
+local jobScore = tonumber(jobs[2])
 
--- Verificar que el trabajo existe
-if redis.call('EXISTS', jobKey) == 0 then
-    redis.call('ZREM', waitKey, jobId)
+if jobScore > tonumber(ARGV[1]) then
+    return nil -- Job no está listo aún
+end
+
+local jobHashKey = KEYS[3] .. ':' .. jobId
+if redis.call('EXISTS', jobHashKey) == 0 then
+    redis.call('ZREM', KEYS[1], jobId)
+    return 'STALE_JOB_REMOVED'
+end
+
+local removedFromWaiting = redis.call('ZREM', KEYS[1], jobId)
+if removedFromWaiting == 0 then
     return nil
 end
 
--- Obtener datos del trabajo antes de moverlo
-local jobData = redis.call('HGETALL', jobKey)
-if #jobData == 0 then
-    redis.call('ZREM', waitKey, jobId)
-    return nil
+local leaseExpiresAt = tonumber(ARGV[1]) + tonumber(ARGV[2])
+
+-- Usar leaseExpiresAt como score en la cola activa
+redis.call('ZADD', KEYS[2], leaseExpiresAt, jobId)
+
+redis.call('HSET', jobHashKey,
+    'status', 'active',
+    'startedAt', ARGV[1],
+    'leaseExpiresAt', leaseExpiresAt -- Guardar cuándo expira el alquiler
+)
+
+redis.call('HINCRBY', KEYS[4], 'waiting', -1)
+redis.call('HINCRBY', KEYS[4], 'active', 1)
+
+local jobDataArray = redis.call('HGETALL', jobHashKey)
+local jobDataMap = {}
+for i = 1, #jobDataArray, 2 do
+    jobDataMap[jobDataArray[i]] = jobDataArray[i+1]
 end
-
--- Mover de waiting a active
-redis.call('ZREM', waitKey, jobId)
-redis.call('ZADD', activeKey, timestamp, jobId)
-
--- Actualizar estado del trabajo
-redis.call('HSET', jobKey, 'status', 'active', 'startedAt', timestamp)
-
--- Actualizar contadores
-redis.call('HINCRBY', queueKey, 'waiting', -1)
-redis.call('HINCRBY', queueKey, 'active', 1)
-
--- Devolver jobId y datos
-return {jobId, cjson.encode(jobData)} 
+return cjson.encode(jobDataMap)

@@ -1,27 +1,30 @@
--- Script para completar un trabajo
-local queueKey = KEYS[1]
-local activeKey = KEYS[2]
-local jobsKey = KEYS[3]
-local completedKey = KEYS[4]
-local jobId = ARGV[1]
-local result = ARGV[2]
-local timestamp = ARGV[3]
+-- completeJob.lua
+--
+-- KEYS[1]: globalQueueCountersKey
+-- KEYS[2]: globalActiveQueueKey
+-- KEYS[3]: jobsHashKeyPrefix
+-- KEYS[4]: globalCompletedQueueKey
+--
+-- ARGV[1]: jobId
+-- ARGV[2]: serializedResult
+-- ARGV[3]: timestamp (completion time)
 
-local jobKey = jobsKey .. ':' .. jobId
+local jobHashKey = KEYS[3] .. ':' .. ARGV[1]
+local removedFromActive = redis.call('ZREM', KEYS[2], ARGV[1])
 
--- Mover de active a completed
-redis.call('ZREM', activeKey, jobId)
-redis.call('ZADD', completedKey, timestamp, jobId)
+redis.call('ZADD', KEYS[4], ARGV[3], ARGV[1])
 
--- Actualizar estado del trabajo
-redis.call('HSET', jobKey, 
+redis.call('HSET', jobHashKey,
     'status', 'completed',
-    'result', result,
-    'finishedAt', timestamp
+    'result', ARGV[2],
+    'completedAt', ARGV[3],
+    'leaseExpiresAt', '' -- Limpiar lease
 )
 
--- Actualizar contadores
-redis.call('HINCRBY', queueKey, 'active', -1)
-redis.call('HINCRBY', queueKey, 'completed', 1)
+if removedFromActive == 1 then
+    redis.call('HINCRBY', KEYS[1], 'active', -1)
+end
+redis.call('HINCRBY', KEYS[1], 'completed', 1)
+redis.call('HINCRBY', KEYS[1], 'totalProcessed', 1) -- Nueva métrica
 
-return 1 
+return 1
