@@ -46,13 +46,13 @@ class Queue {
 
         for (const [name, def] of Object.entries(scriptDefinitions)) {
             if (!def.lua) {
-                console.warn(`[Queue ${this.name}] Lua script for '${name}' (expected file: ${name.replace('Lua','').toLowerCase()}.lua or similar) not found or loaded. Functionality depending on it will fail.`);
+                console.warn(`[Queue ${this.name}] Lua script for '${name}' (expected file: ${name.replace('Lua', '').toLowerCase()}.lua or similar) not found or loaded. Functionality depending on it will fail.`);
                 continue;
             }
             // Usar el nombre de la propiedad (ej. 'handleFailureLua') para definir el comando
             this.scripts[name] = this.redis.defineCommand(name, def);
         }
-        
+
         const countersExist = await this.redis.exists(this.keys.queue);
         if (!countersExist) {
             await this.redis.hmset(this.keys.queue, {
@@ -63,39 +63,50 @@ class Queue {
     }
 
     async add(data, options = {}) {
-        const jobId = uuidv4();
+        const jobId = uuidv4(); // Genera el ID aquí
         const creationTimestamp = Date.now();
         const partitionKey = options.partitionKey || 'default';
-        
+
         const delay = options.delay || 0;
         const scoreForWaitingQueue = creationTimestamp + delay;
 
-        const jobDataForRedis = {
-            id: jobId,
+        const jobDataForRedis = { // Este objeto se guarda en Redis
+            id: jobId, // El ID generado se incluye aquí
             data: JSON.stringify(data),
             timestamp: creationTimestamp,
             attempts: 0,
-            maxRetries: options.maxRetries || 3,
+            maxRetries: options.maxRetries || 3, // Deberías tomar de this.options.defaultJobOptions si no está en options
             status: 'waiting',
             partitionKey,
-            scheduledAt: scoreForWaitingQueue, // Guardar cuándo estaba programado (score)
+            scheduledAt: scoreForWaitingQueue,
         };
 
         const partitionSpecificWaitingQueueKey = this.getPartitionKey(partitionKey);
 
-        if (!this.scripts.addJob) throw new Error("addJob script not loaded");
-        await this.scripts.addJob(
-            this.keys.jobs,
-            partitionSpecificWaitingQueueKey,
-            this.keys.partitions,
-            this.keys.queue,
-            jobId,
-            JSON.stringify(jobDataForRedis),
-            scoreForWaitingQueue,
-            partitionKey
-        );
+        if (!this.scripts.addJob) {
+            console.error(`[Queue ${this.name}] CRITICAL: addJob script not loaded/defined. Cannot add job.`);
+            throw new Error("addJob script not loaded. Ensure queue.init() was called and succeeded.");
+        }
 
-        return jobId;
+        try {
+            // El script Lua addJob también puede devolver el jobId, pero esta función
+            // ya tiene el jobId generado por uuidv4.
+            await this.scripts.addJob(
+                this.keys.jobs,
+                partitionSpecificWaitingQueueKey,
+                this.keys.partitions,
+                this.keys.queue,
+                jobId, // Se pasa el jobId generado al script
+                JSON.stringify(jobDataForRedis),
+                scoreForWaitingQueue,
+                partitionKey
+            );
+        } catch (scriptError) {
+            console.error(`[Queue ${this.name}] Error executing addJob script for job ${jobId}:`, scriptError);
+            throw scriptError;
+        }
+
+        return jobId; // DEVUELVES EL STRING jobId
     }
 
     async getJobById(jobId) {
@@ -126,7 +137,10 @@ class Queue {
         const partitionQueueKey = this.getPartitionKey(partition);
         const leaseDuration = (this.options.defaultJobOptions && this.options.defaultJobOptions.leaseDuration) || 30000;
 
-        if (!this.scripts.getNextJob) throw new Error("getNextJob script not loaded");
+        if (!this.scripts.getNextJob) {
+            console.error(`[Queue ${this.name}] CRITICAL: getNextJob script not loaded/defined.`);
+            throw new Error("getNextJob script not loaded. Ensure queue.init() was called and succeeded.");
+        }
         const jobDataJson = await this.scripts.getNextJob(
             partitionQueueKey,
             this.keys.active,
@@ -146,7 +160,7 @@ class Queue {
             const jobDataFromLua = JSON.parse(jobDataJson);
             const job = { ...jobDataFromLua };
             ['timestamp', 'attempts', 'maxRetries', 'startedAt', 'leaseExpiresAt', 'scheduledAt'].forEach(field => {
-                 if (job[field] !== undefined && job[field] !== null && job[field] !== '') job[field] = parseInt(job[field], 10);
+                if (job[field] !== undefined && job[field] !== null && job[field] !== '') job[field] = parseInt(job[field], 10);
             });
             if (job.data && typeof job.data === 'string') job.data = JSON.parse(job.data);
             return job;
@@ -158,8 +172,9 @@ class Queue {
 
     async renewJobLease(jobId, leaseDuration) {
         if (!this.scripts.renewJobLease) {
-            console.error(`[Queue ${this.name}] renewJobLease script not defined.`);
-            return 0; // Indicar fallo
+            console.error(`[Queue ${this.name}] CRITICAL: renewJobLease script not loaded/defined.`);
+            // Considera lanzar un error o devolver un valor que indique fallo crítico
+            return 0;
         }
         try {
             const result = await this.scripts.renewJobLease(
@@ -172,19 +187,16 @@ class Queue {
             return parseInt(result, 10);
         } catch (error) {
             console.error(`[Queue ${this.name}] Error renewing lease for job ${jobId}:`, error);
-            // No relanzar para no parar el worker, pero sí loguear. El worker podría decidir parar si esto falla consistentemente.
             return 0;
         }
     }
 
     async findAndRequeueStalledJobs(maxAgeBeforeStalled = 0, maxJobsToProcess = 10) {
         if (!this.scripts.requeueStalledJob) {
-            console.error(`[Queue ${this.name}] requeueStalledJob script not defined.`);
-            return { processed: 0, requeued: 0, failed: 0, errors: 0 };
+            console.error(`[Queue ${this.name}] CRITICAL: requeueStalledJob script not loaded/defined.`);
+            return { processed: 0, requeued: 0, failed: 0, errors: 0, other: 0 };
         }
         const results = { processed: 0, requeued: 0, failed: 0, errors: 0, other: 0 };
-        // Los jobs en la cola activa están scoreados por su 'leaseExpiresAt'.
-        // Buscamos aquellos cuyo leaseExpiresAt es menor que el tiempo actual menos un margen.
         const cutOffTime = Date.now() - maxAgeBeforeStalled;
 
         const stalledJobIds = await this.redis.zrangebyscore(this.keys.active, '-inf', `(${cutOffTime}`, 'LIMIT', 0, maxJobsToProcess);
@@ -246,10 +258,10 @@ class Queue {
             }
             const counts = await multi.exec();
             partitions.forEach((partition, index) => {
-                partitionStats[partition] = (counts[index] && counts[index][1] !== null) ? counts[index][1] : 0;
+                partitionStats[partition] = (counts[index] && counts[index][1] !== null) ? parseInt(counts[index][1], 10) : 0;
             });
         }
-        
+
         const globalCounters = {};
         for (const key in statusReply) {
             globalCounters[key] = parseInt(statusReply[key], 10) || 0;
@@ -262,21 +274,24 @@ class Queue {
     }
 
     async drain() {
-        if (!this.scripts.drain) throw new Error("drain script not loaded");
+        if (!this.scripts.drain) {
+            console.error(`[Queue ${this.name}] CRITICAL: drain script not loaded/defined.`);
+            throw new Error("drain script not loaded. Ensure queue.init() was called and succeeded.");
+        }
         try {
             const totalJobsDeleted = await this.scripts.drain(
                 this.keys.jobs, this.keys.partitions, this.keys.waitingPrefix,
                 this.keys.active, this.keys.completed, this.keys.failed, this.keys.queue
             );
             console.log(`[Queue ${this.name}] Drain successful. ${totalJobsDeleted} individual job hashes deleted.`);
-            // Re-inicializar contadores y scripts (init es idempotente)
             await this.init();
         } catch (error) {
             console.error(`[Queue ${this.name}] Error during drain operation:`, error);
             throw error;
         }
     }
-     async debug() {
+
+    async debug() {
         const status = await this.getQueueStatus();
         console.log(`Global queue status (${this.name}):`, status.global);
         console.log(`Partition status (${this.name}):`, status.partitions);
@@ -291,9 +306,9 @@ class Queue {
 
         const activeJobs = await this.redis.zrange(this.keys.active, 0, -1, 'WITHSCORES');
         if (activeJobs.length > 0) console.log(`\nActive jobs (${this.keys.active}):`, activeJobs);
-        
+
         const completedJobs = await this.redis.zrange(this.keys.completed, 0, -1, 'WITHSCORES');
-         if (completedJobs.length > 0) console.log(`\nCompleted jobs (${this.keys.completed}):`, completedJobs);
+        if (completedJobs.length > 0) console.log(`\nCompleted jobs (${this.keys.completed}):`, completedJobs);
 
         const failedJobs = await this.redis.zrange(this.keys.failed, 0, -1, 'WITHSCORES');
         if (failedJobs.length > 0) console.log(`\nFailed jobs (${this.keys.failed}):`, failedJobs);
