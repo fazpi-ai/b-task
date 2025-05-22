@@ -6,24 +6,21 @@ class Worker extends EventEmitter {
         super();
         this.queueName = queueName;
         this.handler = handler;
-        // Incorporar nuevas opciones y defaults
         this.options = {
-            concurrency: 1, // Concurrencia por partición DENTRO de esta instancia de worker
-            maxRetries: 3,     // Default para jobs si no lo especifican en el job mismo
-            backoffDelay: 1000, // ms para reintentos de job
-            partitionDiscoveryInterval: 5000, // ms para buscar nuevas particiones
-            noJobSleep: 1000, // ms para dormir si no hay jobs en una partición
-            // Opciones para el manejo de "lease" (alquiler) de jobs
-            leaseDuration: (options.queueOptions && options.queueOptions.defaultJobOptions && options.queueOptions.defaultJobOptions.leaseDuration) || 30000, // ms
-            leaseRenewInterval: options.leaseRenewInterval || 10000, // ms, debe ser < leaseDuration y > 0
-            gracefulShutdownTimeout: 30000, // ms
-            redis: options.redis, // Para pasar la config de redis a la Queue
-            ...options, // Sobrescribir defaults con opciones pasadas
+            concurrency: 1, 
+            maxRetries: 3,     
+            backoffDelay: 1000, 
+            partitionDiscoveryInterval: 5000, 
+            noJobSleep: 1000, 
+            leaseDuration: (options.queueOptions && options.queueOptions.defaultJobOptions && options.queueOptions.defaultJobOptions.leaseDuration) || 30000, 
+            leaseRenewInterval: options.leaseRenewInterval || 10000, 
+            gracefulShutdownTimeout: 30000, 
+            redis: options.redis, 
+            ...options, 
         };
 
-        // Pasar las opciones de redis y defaultJobOptions a la instancia de Queue
         const queueOptions = {
-            redis: this.options.redis, // Puede ser undefined, Queue usará su default
+            redis: this.options.redis, 
             defaultJobOptions: {
                 leaseDuration: this.options.leaseDuration,
                 stalledJobRetryDelay: (this.options.defaultJobOptions && this.options.defaultJobOptions.stalledJobRetryDelay) || 5000,
@@ -32,15 +29,8 @@ class Worker extends EventEmitter {
         this.queue = new Queue(queueName, queueOptions);
         
         this.isRunning = false;
-        this.activeJobPromises = new Set(); // Para rastrear promesas de processJob en curso
-        this.partitionWorkersController = new Map(); // Control por partición
-
-        // Recordatorio sobre idempotencia (documentación/comentario):
-        // Es CRUCIAL que el 'handler' provisto sea idempotente siempre que sea posible.
-        // En ciertos escenarios de fallo (ej. crash del worker después de que el handler
-        // procesó exitosamente pero antes de que el job fuera marcado como completado),
-        // un job podría ser procesado más de una vez tras un reintento o recuperación de "stalled job".
-        // El 'jobId' único puede ayudar a implementar la idempotencia en el handler.
+        this.activeJobPromises = new Set(); 
+        this.partitionWorkersController = new Map(); 
     }
 
     on(eventName, listener) {
@@ -49,7 +39,7 @@ class Worker extends EventEmitter {
     }
 
     async init() {
-        await this.queue.init(); // Esto define los scripts Lua en this.queue.scripts
+        await this.queue.init(); 
     }
 
     async start() {
@@ -78,10 +68,7 @@ class Worker extends EventEmitter {
                         this._startWorkersForPartition(partition);
                     }
                 }
-                // TODO: Podría haber lógica para detener workers de particiones que ya no existen.
-                // Esto requeriría comparar la lista actual de particiones con la anterior
-                // y llamar a _stopWorkersForPartition si es necesario.
-
+                
                 await new Promise(resolve => setTimeout(resolve, this.options.partitionDiscoveryInterval));
             } catch (error) {
                 console.error(`[Worker ${this.queueName}] Error in partition discovery:`, error);
@@ -95,7 +82,7 @@ class Worker extends EventEmitter {
     }
 
     _startWorkersForPartition(partition) {
-        if (!this.isRunning) return; // No iniciar si el worker general se está deteniendo
+        if (!this.isRunning) return; 
 
         const partitionControl = { running: true, promises: new Set() };
         this.partitionWorkersController.set(partition, partitionControl);
@@ -103,20 +90,26 @@ class Worker extends EventEmitter {
         console.log(`[Worker ${this.queueName}] Starting ${this.options.concurrency} worker loops for partition ${partition}.`);
         for (let i = 0; i < this.options.concurrency; i++) {
             const workerId = `${this.queueName}-${partition}-worker-${i + 1}`;
-            // Envolver el _workerLoop en una función async para manejar su ciclo de vida de promesa
             const loopFn = async () => {
-                try {
-                    await this._workerLoop(workerId, partition, partitionControl);
-                } catch (loopError) {
-                    // Errores no esperados que terminen _workerLoop abruptamente
-                    console.error(`[${workerId}] Worker loop ended with unhandled error:`, loopError);
-                    this.emit('worker.error', { error: loopError, context: 'workerLoopUnhandled', workerId, partition, queueName: this.queueName });
-                } finally {
-                     partitionControl.promises.delete(currentPromise); // Limpiar la promesa del set
-                }
+                // Captura la promesa actual para poder eliminarla en el finally
+                let currentPromise; 
+                const promiseExecutor = async () => {
+                    try {
+                        await this._workerLoop(workerId, partition, partitionControl);
+                    } catch (loopError) {
+                        console.error(`[${workerId}] Worker loop ended with unhandled error:`, loopError);
+                        this.emit('worker.error', { error: loopError, context: 'workerLoopUnhandled', workerId, partition, queueName: this.queueName });
+                    } finally {
+                         if (currentPromise) { // Asegurarse que currentPromise está definida
+                            partitionControl.promises.delete(currentPromise); 
+                         }
+                    }
+                };
+                currentPromise = promiseExecutor();
+                return currentPromise;
             };
-            const currentPromise = loopFn();
-            partitionControl.promises.add(currentPromise);
+            const workerPromise = loopFn(); // Ejecuta la función que devuelve la promesa
+            partitionControl.promises.add(workerPromise); // Añade la promesa devuelta
         }
     }
 
@@ -125,15 +118,12 @@ class Worker extends EventEmitter {
         if (partitionControl) {
             console.log(`[Worker ${this.queueName}] Signaling worker loops for partition ${partition} to stop.`);
             partitionControl.running = false;
-            // No eliminamos de this.partitionWorkersController aquí; se espera que los bucles terminen.
-            // La parada general del worker se encargará de esperar estas promesas.
         }
     }
 
 
     async _workerLoop(workerId, partition, partitionControl) {
         this.emit('partition.worker.started', { workerId, partition, queueName: this.queueName });
-        // console.log(`[${workerId}] Worker loop started for partition ${partition}`); // Ya logueado en _startWorkersForPartition
 
         while (this.isRunning && partitionControl.running) {
             let job = null;
@@ -169,8 +159,7 @@ class Worker extends EventEmitter {
     async processJob(job, workerId) {
         const previousAttempts = parseInt(job.attempts || 0, 10);
         const currentAttemptNumber = previousAttempts + 1;
-        // job.startedAt es establecido por getNextJob.lua al tomar el job
-        const jobTakenTimestamp = job.startedAt || Date.now(); // Fallback por si acaso
+        const jobTakenTimestamp = job.startedAt || Date.now(); 
         let processingTimeMs = 0;
 
         console.log(`[${workerId}] Processing job ${job.id} from partition ${job.partitionKey} (attempt ${currentAttemptNumber}/${job.maxRetries}, lease initially expires at: ${new Date(job.leaseExpiresAt).toISOString()})`);
@@ -184,10 +173,8 @@ class Worker extends EventEmitter {
                         clearInterval(leaseIntervalId);
                         return;
                     }
-                    // console.debug(`[${workerId}] Attempting to renew lease for job ${job.id}`);
                     const renewed = await this.queue.renewJobLease(job.id, this.options.leaseDuration);
                     if (renewed === 1) {
-                         // console.debug(`[${workerId}] Lease renewed for job ${job.id}`);
                         this.emit('job.lease_renewed', { jobId: job.id, workerId, newLeaseExpiresAt: Date.now() + this.options.leaseDuration, queueName: this.queueName });
                     } else {
                         console.warn(`[${workerId}] Failed to renew lease for job ${job.id} (or job no longer active/found). Stopping renewal for this job.`);
@@ -202,7 +189,7 @@ class Worker extends EventEmitter {
         try {
             const result = await this.handler(job.data, {
                 id: job.id, timestamp: job.timestamp, attempts: previousAttempts,
-                partitionKey: job.partitionKey, status: 'active', // Status es 'active' porque lo estamos procesando
+                partitionKey: job.partitionKey, status: 'active', 
                 startedAt: jobTakenTimestamp, leaseExpiresAt: job.leaseExpiresAt
             });
             processingTimeMs = Date.now() - jobTakenTimestamp;
@@ -212,7 +199,6 @@ class Worker extends EventEmitter {
             processingTimeMs = Date.now() - jobTakenTimestamp;
             console.warn(`[${workerId}] Handler error processing job ${job.id} (attempt ${currentAttemptNumber}, time ${processingTimeMs}ms):`, errorFromHandler.message);
             await this.failJob(job, errorFromHandler, workerId, currentAttemptNumber, processingTimeMs);
-            // No re-lanzar, failJob emite los eventos y el bucle debe continuar.
         } finally {
             if (leaseIntervalId) {
                 clearInterval(leaseIntervalId);
@@ -234,7 +220,7 @@ class Worker extends EventEmitter {
         } catch (scriptError) {
             console.error(`[${workerId}] CRITICAL: Failed to execute completeJob Lua script for job ${job.id}:`, scriptError);
             this.emit('job.error', { jobId: job.id, job, error: scriptError, phase: 'completing', workerId, processingTimeMs, queueName: this.queueName });
-            throw scriptError; // Relanzar para que processJob (si lo llama directamente) pueda manejarlo.
+            throw scriptError; 
         }
     }
 
@@ -247,18 +233,29 @@ class Worker extends EventEmitter {
         const willRetry = attemptThatFailed < maxRetries;
 
         if (willRetry) {
-            delayForEvent = this.options.backoffDelay * Math.pow(2, attemptThatFailed - 1); // Exponencial backoff
+            delayForEvent = this.options.backoffDelay * Math.pow(2, attemptThatFailed - 1); 
             nextTryTimestamp = timestamp + delayForEvent;
         }
         const partitionWaitingQueueKey = this.queue.getPartitionKey(job.partitionKey);
 
         if (!this.queue.scripts.handleFailureLua) throw new Error("handleFailureLua script not loaded in queue");
         try {
+            // Llamada al script LUA 'handleFailureLua' ajustada
             const scriptResult = await this.queue.scripts.handleFailureLua(
-                this.queue.keys.jobs, this.queue.keys.active,
-                partitionWaitingQueueKey, this.queue.keys.failed, this.queue.keys.queue,
-                job.id, errorDetailsForRedis, timestamp, attemptThatFailed, maxRetries,
-                nextTryTimestamp, job.partitionKey
+                this.queue.keys.jobs,                 // KEYS[1]
+                this.queue.keys.active,               // KEYS[2]
+                partitionWaitingQueueKey,             // KEYS[3]
+                this.queue.keys.failed,               // KEYS[4]
+                this.queue.keys.queue,                // KEYS[5]
+                this.queue.keys.failedLog,            // KEYS[6] - Nueva KEY para el log de fallos
+                job.id,                               // ARGV[1]
+                errorDetailsForRedis,                 // ARGV[2]
+                timestamp,                            // ARGV[3]
+                attemptThatFailed,                    // ARGV[4]
+                maxRetries,                           // ARGV[5]
+                nextTryTimestamp,                     // ARGV[6]
+                job.partitionKey,                     // ARGV[7]
+                this.queue.name                       // ARGV[8] - Nuevo ARGV para queueName
             );
 
             const eventPayload = { jobId: job.id, job, error: { message: error.message, name: error.name, stack: error.stack }, attempt: attemptThatFailed, maxRetries, workerId, processingTimeMs, queueName: this.queueName };
@@ -270,7 +267,6 @@ class Worker extends EventEmitter {
                 console.error(`[${workerId}] Job ${job.id} (attempt ${attemptThatFailed}, time ${processingTimeMs}ms) failed permanently. Error: ${error.message}`);
                 this.emit('job.failed', eventPayload);
             } else {
-                // Resultado inesperado del script Lua
                 console.error(`[${workerId}] Unexpected result from handleFailureLua script: ${scriptResult} for job ${job.id}`);
                 this.emit('job.error', { ...eventPayload, error: new Error(`Unexpected Lua script result: ${scriptResult}`), phase: 'failing_script_unknown_result' });
             }
@@ -284,33 +280,25 @@ class Worker extends EventEmitter {
     async stop() {
         if (!this.isRunning) {
             this.emit('worker.already_stopped', { queueName: this.queueName });
-            // console.warn(`[Worker ${this.queueName}] Stop called but already stopped.`);
             return;
         }
         this.emit('worker.stopping', { queueName: this.queueName });
         console.log(`[Worker ${this.queueName}] Stopping...`);
         this.isRunning = false;
 
-        // Señalizar a todos los bucles de worker de partición para que se detengan
         this.partitionWorkersController.forEach((control, partition) => {
-            // console.debug(`[Worker ${this.queueName}] Signaling workers for partition ${partition} to stop.`);
             control.running = false;
         });
 
-        // Esperar a que los bucles _workerLoop terminen (no necesariamente los jobs que están procesando)
         const allPartitionWorkerLoopPromises = [];
         this.partitionWorkersController.forEach(control => {
             control.promises.forEach(p => allPartitionWorkerLoopPromises.push(p));
         });
         if (allPartitionWorkerLoopPromises.length > 0) {
-            // console.debug(`[Worker ${this.queueName}] Waiting for ${allPartitionWorkerLoopPromises.length} partition worker loops to exit.`);
             await Promise.allSettled(allPartitionWorkerLoopPromises);
         }
-        // console.debug(`[Worker ${this.queueName}] All partition worker loops have exited.`);
         this.partitionWorkersController.clear();
 
-
-        // Esperar a que los jobs actualmente en processJob (this.activeJobPromises) terminen o timeout
         if (this.activeJobPromises.size > 0) {
             console.log(`[Worker ${this.queueName}] Waiting for ${this.activeJobPromises.size} active jobs to complete (timeout: ${this.options.gracefulShutdownTimeout}ms)...`);
             try {
@@ -318,13 +306,10 @@ class Worker extends EventEmitter {
                     Promise.allSettled(Array.from(this.activeJobPromises)),
                     new Promise((_, reject) => setTimeout(() => reject(new Error('Graceful shutdown timeout for active jobs')), this.options.gracefulShutdownTimeout))
                 ]);
-                // console.debug(`[Worker ${this.queueName}] Active jobs processing finished or timed out.`);
             } catch (timeoutError) {
                 console.warn(`[Worker ${this.queueName}] While waiting for active jobs: ${timeoutError.message}`);
                 this.emit('worker.error', { error: timeoutError, context: 'gracefulShutdownActiveJobs', queueName: this.queueName });
             }
-        } else {
-            // console.debug(`[Worker ${this.queueName}] No active jobs to wait for.`);
         }
 
         try {

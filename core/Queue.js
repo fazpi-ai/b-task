@@ -1,6 +1,6 @@
 import Redis from 'ioredis';
 import { v4 as uuidv4 } from 'uuid';
-import { loadScripts } from '../utils/index.js'; // Asegúrate que la ruta es correcta
+import { loadScripts } from '../utils/index.js';
 
 class Queue {
     constructor(name, options = {}) {
@@ -13,7 +13,7 @@ class Queue {
                 ...options.defaultJobOptions,
             },
         };
-        this.redis = new Redis(this.options.redis); // Comentar sobre pasar más opciones de ioredis aquí
+        this.redis = new Redis(this.options.redis);
 
         this.keys = {
             queue: `queue:${name}`,
@@ -23,6 +23,7 @@ class Queue {
             active: `queue:${name}:active`,
             completed: `queue:${name}:completed`,
             failed: `queue:${name}:failed`,
+            failedLog: `log:${name}:failed_jobs`, // Nueva clave para el log de trabajos fallidos
         };
         this.scripts = {};
     }
@@ -40,9 +41,11 @@ class Queue {
             addJob: { numberOfKeys: 4, lua: loadedLuaScripts.addJob },
             getNextJob: { numberOfKeys: 4, lua: loadedLuaScripts.getNextJob },
             completeJob: { numberOfKeys: 4, lua: loadedLuaScripts.completeJob },
-            handleFailureLua: { numberOfKeys: 5, lua: loadedLuaScripts.handleFailure }, // Archivo: handleFailure.lua
+            // handleFailureLua ahora espera 6 KEYS. La llamada se ajusta en Worker.js
+            handleFailureLua: { numberOfKeys: 6, lua: loadedLuaScripts.handleFailure },
             renewJobLease: { numberOfKeys: 2, lua: loadedLuaScripts.renewJobLease },
-            requeueStalledJob: { numberOfKeys: 5, lua: loadedLuaScripts.requeueStalledJob },
+            // requeueStalledJob ahora espera 6 KEYS.
+            requeueStalledJob: { numberOfKeys: 6, lua: loadedLuaScripts.requeueStalledJob },
             drain: { numberOfKeys: 7, lua: loadedLuaScripts.drain },
         };
 
@@ -53,17 +56,14 @@ class Queue {
             }
             console.log(`Definiendo comando '${name}' en Redis...`);
             try {
-                // Definir el comando en Redis
                 const sha = await this.redis.script('load', def.lua);
                 console.log(`Script '${name}' cargado con SHA: ${sha}`);
-                
-                // Crear una función que ejecute el script
+
                 this.scripts[name] = async (...args) => {
                     try {
                         return await this.redis.evalsha(sha, def.numberOfKeys, ...args);
                     } catch (err) {
                         if (err.message.includes('NOSCRIPT')) {
-                            // Si el script no está en Redis, volver a cargarlo
                             const newSha = await this.redis.script('load', def.lua);
                             return await this.redis.evalsha(newSha, def.numberOfKeys, ...args);
                         }
@@ -91,19 +91,19 @@ class Queue {
     }
 
     async add(data, options = {}) {
-        const jobId = uuidv4(); // Genera el ID aquí
+        const jobId = uuidv4();
         const creationTimestamp = Date.now();
         const partitionKey = options.partitionKey || 'default';
 
         const delay = options.delay || 0;
         const scoreForWaitingQueue = creationTimestamp + delay;
 
-        const jobDataForRedis = { // Este objeto se guarda en Redis
-            id: jobId, // El ID generado se incluye aquí
+        const jobDataForRedis = {
+            id: jobId,
             data: JSON.stringify(data),
             timestamp: creationTimestamp,
             attempts: 0,
-            maxRetries: options.maxRetries || 3, // Deberías tomar de this.options.defaultJobOptions si no está en options
+            maxRetries: options.maxRetries || this.options.defaultJobOptions.maxRetries || 3,
             status: 'waiting',
             partitionKey,
             scheduledAt: scoreForWaitingQueue,
@@ -117,14 +117,12 @@ class Queue {
         }
 
         try {
-            // El script Lua addJob también puede devolver el jobId, pero esta función
-            // ya tiene el jobId generado por uuidv4.
             await this.scripts.addJob(
                 this.keys.jobs,
                 partitionSpecificWaitingQueueKey,
                 this.keys.partitions,
                 this.keys.queue,
-                jobId, // Se pasa el jobId generado al script
+                jobId,
                 JSON.stringify(jobDataForRedis),
                 scoreForWaitingQueue,
                 partitionKey
@@ -134,7 +132,7 @@ class Queue {
             throw scriptError;
         }
 
-        return jobId; // DEVUELVES EL STRING jobId
+        return jobId;
     }
 
     async getJobById(jobId) {
@@ -201,7 +199,6 @@ class Queue {
     async renewJobLease(jobId, leaseDuration) {
         if (!this.scripts.renewJobLease) {
             console.error(`[Queue ${this.name}] CRITICAL: renewJobLease script not loaded/defined.`);
-            // Considera lanzar un error o devolver un valor que indique fallo crítico
             return 0;
         }
         try {
@@ -239,16 +236,19 @@ class Queue {
 
         for (const jobId of stalledJobIds) {
             try {
+                // Llamada al script LUA 'requeueStalledJob' ajustada
                 const status = await this.scripts.requeueStalledJob(
-                    this.keys.jobs,
-                    this.keys.active,
-                    this.keys.waitingPrefix,
-                    this.keys.failed,
-                    this.keys.queue,
-                    jobId,
-                    stalledErrorMsg,
-                    Date.now(),
-                    retryDelay
+                    this.keys.jobs,           // KEYS[1]
+                    this.keys.active,         // KEYS[2]
+                    this.keys.waitingPrefix,  // KEYS[3]
+                    this.keys.failed,         // KEYS[4]
+                    this.keys.queue,          // KEYS[5]
+                    this.keys.failedLog,      // KEYS[6] - Nueva KEY para el log de fallos
+                    jobId,                    // ARGV[1]
+                    stalledErrorMsg,          // ARGV[2]
+                    Date.now(),               // ARGV[3] - currentTime
+                    retryDelay,               // ARGV[4] - retryDelayMs
+                    this.name                 // ARGV[5] - Nuevo ARGV para queueName
                 );
                 results.processed++;
                 if (status === 'REQUEUED_STALLED') results.requeued++;
@@ -307,12 +307,17 @@ class Queue {
             throw new Error("drain script not loaded. Ensure queue.init() was called and succeeded.");
         }
         try {
+            // Nota: El script 'drain.lua' también necesitaría ser consciente de 'failedLog' si debe limpiarlo.
+            // Por ahora, esta llamada no pasa this.keys.failedLog.
+            // Si drain debe limpiar TODO, considera agregar failedLog a las KEYS de drain.lua y pasarlo aquí.
             const totalJobsDeleted = await this.scripts.drain(
                 this.keys.jobs, this.keys.partitions, this.keys.waitingPrefix,
                 this.keys.active, this.keys.completed, this.keys.failed, this.keys.queue
             );
             console.log(`[Queue ${this.name}] Drain successful. ${totalJobsDeleted} individual job hashes deleted.`);
-            await this.init();
+            // Adicionalmente, limpiar el log de fallos si 'drain' no lo hace
+            await this.redis.del(this.keys.failedLog);
+            await this.init(); // Re-inicializa contadores y carga scripts (los scripts ya estarían cargados en SHA)
         } catch (error) {
             console.error(`[Queue ${this.name}] Error during drain operation:`, error);
             throw error;
@@ -340,6 +345,13 @@ class Queue {
 
         const failedJobs = await this.redis.zrange(this.keys.failed, 0, -1, 'WITHSCORES');
         if (failedJobs.length > 0) console.log(`\nFailed jobs (${this.keys.failed}):`, failedJobs);
+
+        const failedLogCount = await this.redis.llen(this.keys.failedLog);
+        if (failedLogCount > 0) {
+            const failedLogEntries = await this.redis.lrange(this.keys.failedLog, 0, Math.min(failedLogCount, 10) - 1); // Muestra hasta 10
+            console.log(`\nRecent failed job log entries (up to 10 of ${failedLogCount} from ${this.keys.failedLog}):`);
+            failedLogEntries.forEach(entry => console.log(JSON.parse(entry)));
+        }
     }
 }
 
